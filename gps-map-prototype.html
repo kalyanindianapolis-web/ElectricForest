@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Forest GPS — Live Crew Map (prototype)</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  :root { --bg:#0f1f14; --panel:#16301f; --ink:#eaffea; --accent:#7CFC9B; --warn:#ffcf6b; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  #map { position:absolute; inset:0; }
+  .bar { position:absolute; z-index:1000; left:8px; right:8px; top:env(safe-area-inset-top,8px);
+    display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .card { background:rgba(22,48,31,.92); border:1px solid #2f5a3c; border-radius:12px;
+    padding:8px 10px; backdrop-filter:blur(6px); font-size:13px; }
+  button { font:inherit; border:0; border-radius:10px; padding:8px 12px; cursor:pointer; }
+  .primary { background:var(--accent); color:#08210f; font-weight:700; }
+  .ghost { background:#23492f; color:var(--ink); }
+  #ovCard { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  #ovCard select { font:inherit; background:#23492f; color:var(--ink); border:1px solid #2f5a3c;
+    border-radius:8px; padding:6px; }
+  #ovCard.calibrating { outline:2px solid var(--warn); }
+  .status { position:absolute; z-index:1000; left:8px; bottom:env(safe-area-inset-bottom,8px);
+    font-size:12px; opacity:.9; }
+  .dot { width:16px; height:16px; border-radius:50%; border:2px solid #fff;
+    box-shadow:0 0 0 2px rgba(0,0,0,.4); }
+  .label { background:#0f1f14cc; padding:2px 6px; border-radius:8px; font-size:11px; white-space:nowrap;
+    border:1px solid #2f5a3c; }
+  .stale { filter:grayscale(.7) opacity(.6); }
+  .me-ring { animation:pulse 2s infinite; }
+  @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(124,252,155,.6)} 100%{box-shadow:0 0 0 14px rgba(124,252,155,0)} }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<div class="bar">
+  <div class="card">
+    <strong>🌲 Forest GPS</strong> · prototype
+  </div>
+  <button id="shareBtn" class="primary">📍 Share my location</button>
+  <button id="layerBtn" class="ghost">🛰️ Satellite</button>
+  <button id="demoBtn" class="ghost">👥 Demo crew: ON</button>
+  <div class="card" id="meInfo">You: not sharing</div>
+  <div class="card" id="ovCard">
+    <button id="ovBtn" class="ghost">🗺️ EF map: OFF</button>
+    <select id="ovSel" title="Which EF map">
+      <option value="venue" selected>Stage core</option>
+      <option value="full">Full grounds</option>
+    </select>
+    <label>opacity <input id="ovOpacity" type="range" min="0" max="100" value="65" style="vertical-align:middle"></label>
+    <button id="ovCal" class="ghost">🎯 Calibrate: OFF</button>
+  </div>
+</div>
+
+<div class="status card" id="status">Loading map…</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<!-- Supabase client (same lib the real app uses). Only used when CONFIG.useSupabase = true -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script>
+/* ============================================================================
+   CONFIG
+   ----------------------------------------------------------------------------
+   This prototype runs in DEMO mode by default (simulated crew, no network) so
+   you can SEE it work immediately. To wire it to the real backend later, set
+   useSupabase:true and fill in the anon key (it's public, already embedded in
+   happyforest.netlify.app). It stores locations in the SAME `kv` table the app
+   already uses — key = "loc:<id>", value = {name,lat,lng,acc}. No new table or
+   admin access needed. updated_at is tracked by the kv row automatically.
+   ============================================================================ */
+const CONFIG = {
+  useSupabase: false,                              // flip to true to go live
+  SUPABASE_URL: "https://dhaiycaywuqvjxmgzwtj.supabase.co",
+  SUPABASE_ANON_KEY: "sb_publishable_ZbL4v6-8mffWsRDB-BC5bg_MXeNkutO", // public by design
+  LOC_PREFIX: "ef26:loc:",                          // matches Andy's recommended key scheme
+  me: { id: "kalyan", name: "Kalyan", color: "#7CFC9B" },
+  pushEveryMs: 30000,                              // Andy: 30-60s is plenty, saves battery
+  pollEveryMs: 15000,                              // how often we re-read crew
+  staleAfterMs: 120000,                            // dot dims after this w/o update
+};
+
+/* Double JJ Resort, Rothbury MI — Electric Forest grounds (approx center). */
+const GROUNDS = { lat: 43.5240, lng: -86.3650, zoom: 16 };
+
+/* Stage pins. Positions are given as FRACTIONS of the "Stage core" (venue) map
+   image — fx = left→right (0..1), fy = top→bottom (0..1) — read off venue-map.jpg.
+   They are converted to lat/lng from that overlay's current bounds, so the pins
+   ride with the art and stay aligned when you calibrate the overlay.
+   (Honeycomb / Grand Artique are best-guess spots in the forest core — nudge if needed.) */
+const LANDMARKS = [
+  { name: "Center Stage",       lat: 43.52867034, lng: -86.36530036 },
+  { name: "Sherwood Court",     lat: 43.52842335, lng: -86.36285314 },
+  { name: "Ranch Arena",        lat: 43.52224425, lng: -86.36445855 },
+  { name: "GA Pre-set Camping", lat: 43.51960838, lng: -86.37306013 },
+  { name: "The Observatory",    fx: 0.66, fy: 0.40 },
+  { name: "Honeycomb",          fx: 0.60, fy: 0.30 },
+  { name: "Grand Artique",      fx: 0.58, fy: 0.52 },
+  { name: "Tripolee",           fx: 0.20, fy: 0.88 },
+];
+
+/* ---------------------------------------------------------------------------- */
+const $ = (id) => document.getElementById(id);
+const setStatus = (m) => { $("status").textContent = m; };
+function ago(ts){ const s=Math.max(0,Math.round((Date.now()-ts)/1000));
+  if(s<60) return s+"s ago"; const m=Math.round(s/60); if(m<60) return m+"m ago";
+  return Math.round(m/60)+"h ago"; }
+
+/* ---- map ---- */
+const map = L.map("map", { zoomControl:true }).setView([GROUNDS.lat, GROUNDS.lng], GROUNDS.zoom);
+const satellite = L.tileLayer(
+  "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+  { maxZoom:19, attribution:"Imagery © Esri" });   // FREE, no API key
+const streets = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+  { maxZoom:19, attribution:"© OpenStreetMap" });
+satellite.addTo(map);
+let satOn = true;
+$("layerBtn").onclick = () => {
+  satOn = !satOn;
+  if(satOn){ map.removeLayer(streets); satellite.addTo(map); $("layerBtn").textContent="🛰️ Satellite"; }
+  else { map.removeLayer(satellite); streets.addTo(map); $("layerBtn").textContent="🗺️ Street"; }
+};
+
+setStatus("Map ready. Grounds: Double JJ Resort, Rothbury MI. Tap “Share my location”.");
+
+/* ---- EF map overlay (georeferenced image over the satellite) ----
+   The official EF maps are stylized art, so they must be hand-fit onto the real
+   grounds. Toggle on, then use Calibrate (arrow keys move, +/- zoom, [ ] width,
+   , . height) until roads/stages line up. Tuned bounds persist in localStorage;
+   copy the printed bounds into OVERLAYS to bake them in. */
+const OVERLAYS = {
+  // {s,w,n,e} = south,west,north,east. Rough starting boxes — calibrate to fit.
+  full:  { file:"full-map.jpg",  b:{ s:43.5000, w:-86.3850, n:43.5400, e:-86.3380 } },
+  venue: { file:"venue-map.jpg", b:{ s:43.5193, w:-86.3722, n:43.5298, e:-86.3599 } },
+};
+let ovKey = "venue", ovLayer = null, ovVisible = false, ovCalib = false;
+let ovOpacity = 0.65;
+
+function loadBounds(key){
+  try { const s = localStorage.getItem("ef:ovbounds:"+key); if(s) return JSON.parse(s); } catch {}
+  return { ...OVERLAYS[key].b };
+}
+function saveBounds(key, b){ try { localStorage.setItem("ef:ovbounds:"+key, JSON.stringify(b)); } catch {} }
+const boundsArr = (b) => [[b.s,b.w],[b.n,b.e]];
+
+/* Stage pins are anchored to the venue map's image fractions → lat/lng. */
+function venueLatLng(fx, fy){
+  const b = loadBounds("venue");
+  return [ b.n - fy*(b.n - b.s), b.w + fx*(b.e - b.w) ];
+}
+let stageMarkers = [];
+function drawStages(){
+  stageMarkers.forEach(m => map.removeLayer(m));
+  stageMarkers = LANDMARKS.map(l => {
+    const [lat,lng] = (l.lat != null) ? [l.lat, l.lng] : venueLatLng(l.fx, l.fy);
+    return L.marker([lat,lng], { icon: L.divIcon({ className:"", html:
+      `<div class="label">⭐ ${l.name}</div>`, iconSize:[1,1] }) }).addTo(map);
+  });
+}
+
+function drawOverlay(){
+  if(ovLayer){ map.removeLayer(ovLayer); ovLayer = null; }
+  if(!ovVisible) return;
+  const b = loadBounds(ovKey);
+  ovLayer = L.imageOverlay(OVERLAYS[ovKey].file, boundsArr(b),
+    { opacity: ovOpacity, interactive:false }).addTo(map);
+  ovLayer.on("error", () => setStatus("Couldn't load "+OVERLAYS[ovKey].file+" — is the file in this folder?"));
+}
+function fitOverlay(){ map.fitBounds(boundsArr(loadBounds(ovKey))); }
+
+$("ovBtn").onclick = () => {
+  ovVisible = !ovVisible;
+  $("ovBtn").textContent = "🗺️ EF map: " + (ovVisible?"ON":"OFF");
+  drawOverlay();
+  if(ovVisible) fitOverlay();
+};
+$("ovSel").onchange = (e) => { ovKey = e.target.value; if(ovVisible){ drawOverlay(); fitOverlay(); } };
+$("ovOpacity").oninput = (e) => { ovOpacity = e.target.value/100; if(ovLayer) ovLayer.setOpacity(ovOpacity); };
+
+$("ovCal").onclick = () => {
+  ovCalib = !ovCalib;
+  $("ovCal").textContent = "🎯 Calibrate: " + (ovCalib?"ON":"OFF");
+  $("ovCard").classList.toggle("calibrating", ovCalib);
+  if(ovCalib && !ovVisible) $("ovBtn").click();
+  setStatus(ovCalib
+    ? "Calibrate: ← → ↑ ↓ move · +/- zoom · [ ] width · , . height · S to save & print bounds"
+    : "Calibrate off.");
+};
+window.addEventListener("keydown", (e) => {
+  if(!ovCalib) return;
+  const b = loadBounds(ovKey);
+  const dLat = (b.n-b.s)*0.02, dLng = (b.e-b.w)*0.02;   // 2% nudges
+  let handled = true;
+  switch(e.key){
+    case "ArrowUp":    b.s+=dLat; b.n+=dLat; break;
+    case "ArrowDown":  b.s-=dLat; b.n-=dLat; break;
+    case "ArrowRight": b.w+=dLng; b.e+=dLng; break;
+    case "ArrowLeft":  b.w-=dLng; b.e-=dLng; break;
+    case "+": case "=": b.s-=dLat; b.n+=dLat; b.w-=dLng; b.e+=dLng; break;   // grow
+    case "-": case "_": b.s+=dLat; b.n-=dLat; b.w+=dLng; b.e-=dLng; break;   // shrink
+    case "]": b.e+=dLng; break;   case "[": b.e-=dLng; break;                // width (east edge)
+    case ".": b.n+=dLat; break;   case ",": b.n-=dLat; break;                // height (north edge)
+    case "s": case "S":
+      console.log(`OVERLAYS.${ovKey}.b =`, JSON.stringify(b));
+      setStatus(`Saved ${ovKey} bounds → s:${b.s.toFixed(5)} w:${b.w.toFixed(5)} n:${b.n.toFixed(5)} e:${b.e.toFixed(5)} (also in console)`);
+      saveBounds(ovKey, b); if(ovKey==="venue") drawStages(); return;
+    default: handled = false;
+  }
+  if(handled){ e.preventDefault(); saveBounds(ovKey, b); drawOverlay(); if(ovKey==="venue") drawStages(); }
+});
+
+drawStages();   // initial stage pins (from venue map bounds)
+
+/* ---- crew dot rendering ---- */
+const markers = {};                                 // id -> {marker, data}
+function renderPerson(p){                            // p:{id,name,color,lat,lng,updated_at}
+  const stale = (Date.now()-p.updated_at) > CONFIG.staleAfterMs;
+  const isMe = p.id === CONFIG.me.id;
+  const html = `<div style="display:flex;flex-direction:column;align-items:center;gap:2px">
+      <div class="dot ${stale?'stale':''} ${isMe?'me-ring':''}" style="background:${p.color||'#7CFC9B'}"></div>
+      <div class="label ${stale?'stale':''}">${p.name} · ${ago(p.updated_at)}</div>
+    </div>`;
+  const icon = L.divIcon({ className:"", html, iconSize:[1,1] });
+  if(markers[p.id]){ markers[p.id].marker.setLatLng([p.lat,p.lng]).setIcon(icon); }
+  else { markers[p.id] = { marker: L.marker([p.lat,p.lng],{icon}).addTo(map) }; }
+  markers[p.id].data = p;
+}
+function refreshLabels(){ Object.values(markers).forEach(m => renderPerson(m.data)); }
+setInterval(refreshLabels, 5000);                   // keep "Xs ago" fresh
+
+/* ---- my location (foreground sharing) ---- */
+let sharing=false, watchId=null, lastPush=0, myPos=null;
+$("shareBtn").onclick = () => sharing ? stopShare() : startShare();
+
+function startShare(){
+  if(!("geolocation" in navigator)){ setStatus("Geolocation not supported on this browser."); return; }
+  watchId = navigator.geolocation.watchPosition(onPos, onGeoErr,
+    { enableHighAccuracy:true, maximumAge:5000, timeout:15000 });
+  sharing=true; $("shareBtn").textContent="🛑 Stop sharing"; $("shareBtn").classList.remove("primary");
+  setStatus("Sharing location… (works while the app is open)");
+}
+function stopShare(){
+  if(watchId!=null) navigator.geolocation.clearWatch(watchId);
+  sharing=false; $("shareBtn").textContent="📍 Share my location"; $("shareBtn").classList.add("primary");
+  $("meInfo").textContent="You: not sharing";
+  if(CONFIG.useSupabase) backend.setSharing(false);
+}
+function onPos(pos){
+  const { latitude:lat, longitude:lng, accuracy:acc } = pos.coords;
+  myPos = { lat, lng, acc };
+  const me = { ...CONFIG.me, lat, lng, accuracy:acc, updated_at:Date.now() };
+  renderPerson(me);
+  $("meInfo").textContent = `You: ±${Math.round(acc)}m · ${ago(me.updated_at)}`;
+  if(!markers[me.id]._centered){ map.setView([lat,lng], 17); markers[me.id]._centered=true; }
+  if(CONFIG.useSupabase && Date.now()-lastPush > CONFIG.pushEveryMs){
+    lastPush=Date.now(); backend.push(me);
+  }
+}
+function onGeoErr(err){
+  setStatus("Location error: "+err.message+
+    (err.code===1 ? " — enable location permission in browser settings." : ""));
+}
+
+/* ---- DEMO crew (simulated, no network) ---- */
+let demoOn=true, demoTimer=null;
+const demoCrew = [
+  { id:"manasa", name:"Manasa", color:"#ff79c6", lat:43.5114, lng:-86.3492 },
+  { id:"ravi",   name:"Ravi",   color:"#8be9fd", lat:43.5101, lng:-86.3470 },
+  { id:"sara",   name:"Sara",   color:"#ffb86c", lat:43.5125, lng:-86.3481 },
+];
+function demoTick(){
+  demoCrew.forEach(p => {
+    p.lat += (Math.random()-0.5)*0.0004; p.lng += (Math.random()-0.5)*0.0004;
+    renderPerson({ ...p, updated_at: Date.now() - (p.id==="sara"? 120000:0) }); // Sara is "stale" demo
+  });
+}
+function setDemo(on){
+  demoOn=on; $("demoBtn").textContent = "👥 Demo crew: "+(on?"ON":"OFF");
+  if(on){ demoTick(); demoTimer=setInterval(demoTick, 4000); }
+  else { clearInterval(demoTimer); demoCrew.forEach(p=>{ if(markers[p.id]){ map.removeLayer(markers[p.id].marker); delete markers[p.id]; }}); }
+}
+$("demoBtn").onclick = () => setDemo(!demoOn);
+
+/* ---- Supabase backend (kv pattern, used only when useSupabase=true) ---- */
+const backend = (() => {
+  if(!CONFIG.useSupabase) return { push(){}, setSharing(){}, start(){} };
+  const sb = window.supabase.createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_ANON_KEY);
+  const P = CONFIG.LOC_PREFIX;                        // "ef26:loc:"
+  async function push(me){
+    await sb.from("kv").upsert({
+      key: P+me.id,
+      value: { name:me.name, color:me.color, lat:me.lat, lng:me.lng, acc:me.accuracy, sharing:true },
+      updated_at: new Date().toISOString()
+    });
+  }
+  async function setSharing(on){
+    await sb.from("kv").upsert({ key:P+CONFIG.me.id,
+      value:{ name:CONFIG.me.name, sharing:on, ...(myPos||{}) }, updated_at:new Date().toISOString() });
+  }
+  async function poll(){
+    const { data, error } = await sb.from("kv").select("key,value,updated_at").like("key",P+"%");
+    if(error){ setStatus("Backend read error: "+error.message); return; }
+    (data||[]).forEach(row => {
+      if(row.key === P+CONFIG.me.id) return;          // skip self
+      const v = row.value || {};
+      if(v.sharing === false || v.lat==null) return;
+      renderPerson({ id:row.key.slice(P.length), name:v.name||row.key, color:v.color,
+        lat:v.lat, lng:v.lng, updated_at: new Date(row.updated_at).getTime() });
+    });
+  }
+  function start(){ poll(); setInterval(poll, CONFIG.pollEveryMs); }
+  return { push, setSharing, start };
+})();
+
+/* ---- boot ---- */
+if(CONFIG.useSupabase){ setDemo(false); backend.start(); setStatus("Live mode: reading crew from Supabase kv…"); }
+else { setDemo(true); }
+</script>
+</body>
+</html>

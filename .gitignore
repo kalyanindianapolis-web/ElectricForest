@@ -1,0 +1,11 @@
+.DS_Store
+app/node_modules/
+app/dist/
+app/ios/App/Pods/
+app/ios/App/build/
+app/ios/DerivedData/
+app/android/.gradle/
+app/android/build/
+app/android/app/build/
+app/android/local.properties
+*.apk
